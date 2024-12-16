@@ -1,0 +1,166 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Deploy Pytorch Cluster
+
+Parameters:
+  VPCID:
+    Description: ID of the VPC
+    Type: String
+    Default: vpc-0a64164a7470dddc3
+
+  SubnetID:
+    Description: ID of the first Subnet
+    Type: String
+    Default: subnet-0120e3d4379cb4846
+
+  Subnet2ID:
+    Description: ID of the second Subnet
+    Type: String
+    Default: subnet-0935ce317e1c7ba94
+
+  IAMInstanceProfileName:
+    Description: Existing IAM Role for EC2
+    Type: String
+    Default: myEC2
+
+Resources:
+  EC2KeyPair:
+    Type: AWS::EC2::KeyPair
+    Properties:
+      KeyName: my-ec2-keypair
+      KeyType: rsa
+      PublicKeyMaterial: "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDphfkOZsnwQPf2lZFefbRkIkbolaMkQeTQ3b9fCF+vyYS6I367i9gIr8hsqTJt+C6j8y8CuENjDt1EMyId6pjBFlQHgIyZdhu/bSokwI9cYMc6T54s7efq4PinYtURqdwLV5lmdCJ9Kvvwumh5h3mpJTwQshHXii6Cu1I4WaB5DIYPqWabUVLrzLqoFts+FiOW9GYI3NlYqONA9xOgvnj4IfnD2WxhDxCA5+buJPebWRvZ0NFBu2Y2g1kzgOdERpxTHMzWqDzTEepM5CP1arYsFbIEbhrK6NO/LgW9eXWzumfa79NTWC3UVMfY5Vy21mhBjGsjeHaEVReaZ5RuBrIP FSOFT.FPT.VN+HongranW@LPP00313261B"
+
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow SSH
+      VpcId: !Ref VPCID
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+
+  SelfCommunicateSGRule:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      IpProtocol: tcp
+      FromPort: 0
+      ToPort: 65535
+      SourceSecurityGroupId: !Ref InstanceSecurityGroup
+      GroupId: !Ref InstanceSecurityGroup
+
+  EFS:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      PerformanceMode: generalPurpose
+      Encrypted: true
+
+  EFSMountTargetA:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EFS
+      SubnetId: !Ref SubnetID
+      SecurityGroups: [!Ref InstanceSecurityGroup]
+
+  EFSMountTargetB:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EFS
+      SubnetId: !Ref Subnet2ID
+      SecurityGroups: [!Ref InstanceSecurityGroup]
+
+  HeadEC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: c3.2xlarge
+      ImageId: ami-0e2c8caa4b6378d8c
+      KeyName: !Ref EC2KeyPair
+      IamInstanceProfile: !Ref IAMInstanceProfileName
+      SecurityGroupIds:
+        - !Ref InstanceSecurityGroup
+      SubnetId: !Ref SubnetID
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 120
+            VolumeType: gp3
+      Tags:
+        - Key: Name
+          Value: HeadNode
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          sudo apt update && sudo apt upgrade -y
+          sudo apt install -y python3-pip unzip curl nfs-common
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+          unzip awscliv2.zip
+          sudo ./aws/install
+          pip install ray torch torchvision torchaudio --break-system-packages
+          sudo mkdir -p /mnt/efs
+          sudo mount -t nfs4 -o nfsvers=4.1,rsize=1048576,wsize=1048576,timeo=600,retrans=2 ${EFS}.efs.${AWS::Region}.amazonaws.com:/ /mnt/efs
+          ray start --head --port=6379
+
+  WorkerNodeLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: WorkerNodeLaunchTemplate
+      LaunchTemplateData:
+        InstanceType: c3.large
+        BlockDeviceMappings:
+          - DeviceName: /dev/sda1
+            Ebs:
+              VolumeSize: 50
+              VolumeType: gp3
+        ImageId: ami-0e2c8caa4b6378d8c
+        KeyName: !Ref EC2KeyPair
+        IamInstanceProfile:
+          Name: !Ref IAMInstanceProfileName
+        SecurityGroupIds:
+          - !Ref InstanceSecurityGroup
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            sudo apt update && sudo apt upgrade -y
+            sudo apt install -y python3-pip unzip curl nfs-common
+            curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+            unzip awscliv2.zip
+            sudo ./aws/install
+            pip install ray torch torchvision torchaudio --break-system-packages
+            sudo mkdir -p /mnt/efs
+            sudo mount -t nfs4 -o nfsvers=4.1,rsize=1048576,wsize=1048576,timeo=600,retrans=2 ${EFS}.efs.${AWS::Region}.amazonaws.com:/ /mnt/efs
+            ray start --address="${HeadEC2Instance.PrivateIp}:6379"
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: WorkerNode
+
+  WorkerNodeAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: WorkerNodeAutoScalingGroup
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WorkerNodeLaunchTemplate
+        Version: !GetAtt WorkerNodeLaunchTemplate.LatestVersionNumber
+      MinSize: "1"
+      MaxSize: "3"
+      DesiredCapacity: "1"
+      VPCZoneIdentifier:
+        - !Ref SubnetID
+        - !Ref Subnet2ID
+      HealthCheckType: EC2
+      HealthCheckGracePeriod: 300
+      Tags:
+        - Key: Environment
+          Value: test
+          PropagateAtLaunch: true
+
+Outputs:
+  HeadEC2PrivateIP:
+    Description: "Private IP of the Head Node"
+    Value: !GetAtt HeadEC2Instance.PrivateIp
+
+  HeadEC2PublicIP:
+    Description: "Public IP of the Head Node"
+    Value: !GetAtt HeadEC2Instance.PublicIp
